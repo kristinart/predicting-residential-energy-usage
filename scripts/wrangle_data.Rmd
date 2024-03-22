@@ -1,0 +1,378 @@
+---
+title: "Predicting Residential Energy Usage based on Weather"
+author: "Kristin Art"
+date: "2024-01-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, results = FALSE)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(ggplot2)
+library(kableExtra)
+library(here)
+library(lubridate)
+library(purrr)
+library(naniar)
+library(corrplot)
+```
+
+
+## Load and tidy data
+
+"let’s extract the month and year from each value and make them their own predictors. The specific days won’t matter as much here, but the particular month will have an impact since it traverses across seasons (November to May)."
+```{r load and tidy weather data}
+# define list of weather files
+weather_files <- list.files(here::here("data/apartment-weather"), full.names = TRUE) 
+
+# define function to process and clean weather data
+tidy_weather_data <- function(file_path) {
+
+  df <- read_csv(file_path) %>% 
+    janitor::clean_names() %>% 
+    mutate(datetime = lubridate::as_datetime(time, origin = "1970-01-01", tz = "America/New_York"),  # Convert unix timestamp to Eastern datetime 
+           date = lubridate::date(datetime),
+           hour = lubridate::hour(datetime),
+           month = lubridate::month(datetime),
+           year = lubridate::year(datetime)) %>% 
+    filter(datetime >= lubridate::ymd_hms("2014-10-15 12:00:00")) # filter data to startdate of apartment data
+  
+  return(df)
+}
+
+# apply function over weather files 
+weather_data <- purrr::map_dfr(weather_files, tidy_weather_data)
+
+# inspect result df
+head(weather_data)
+summary(weather_data)
+```
+
+
+```{r load and tidy apartment data}
+# define list of apartment files
+apt_files <- list.files(here::here("data/apartment"), pattern = ".csv", full.names = TRUE, recursive = TRUE) 
+
+# define function to process and clean apartment data
+tidy_apartment_data <- function(file_path) {
+  df <- read_csv(file_path, col_names = c("datetime", "power_kw"), col_types = cols(datetime = col_datetime(), power_kw = col_double())) %>%
+    clean_names() %>%
+    mutate(apt_id = as.numeric(stringr::str_extract(basename(file_path), "Apt(\\d+)_\\d{4}") %>% stringr::str_extract("(?<=Apt)\\d+")),
+           datetime = lubridate::ymd_hms(datetime),
+           date = lubridate::date(datetime),
+           hour = lubridate::hour(datetime)) %>%
+    group_by(date, hour, apt_id) %>%
+    summarize(hourly_average_power_kw = as.numeric(mean(as.numeric(power_kw), na.rm = TRUE))) %>%
+    ungroup()
+  
+  return(df)
+
+}
+
+# apply function over all apartment files 
+apt_data <- purrr::map_dfr(apt_files, tidy_apartment_data )
+
+# inspect result df
+head(apt_data)
+summary(apt_data)
+
+```
+
+
+Next, I combine the two datasets into one by joining them based on the common date and hour columns. I also define the month, year, and apartment IDs as factors to make it easier to plot later on.
+```{r combine all data and tidy}
+# combine weather and apartment data
+smart_df <- apt_data %>% 
+  full_join(weather_data, by = c("date", "hour"), relationship = "many-to-many") %>% 
+  mutate_at(vars(hour,hourly_average_power_kw, temperature, humidity, visibility, apparent_temperature, pressure, wind_speed, cloud_cover, wind_bearing, precip_intensity, dew_point, precip_probability), as.numeric) %>% 
+  mutate_at(vars(month, year, apt_id), as.factor)
+```
+
+
+Now that I have all my data in one dataframe, my first real step is to figure out how much data is missing from my combined dataset. Here I use the vis_miss() function from the naniar package to visualize any missing values. 
+```{r visualize nas}
+# visualize missing data
+smart_df %>%
+  naniar::vis_miss(warn_large_data = FALSE)
+```
+
+Surprisingly, the dataset is near-complete! Only 1% of it is missing (this might be a new record for me). Nearly all of the missing values are from the cloud_cover column. I wonder why this variable is missing so many observations in an otherwise comprehensive dataset - maybe cloud cover relied on manual human measurement while the other variables were automatically measured by instruments.
+
+Since the cloud_cover variable is missing 13% of data and is not one of the most impactful predictor variables, I am going to drop the entire variable from the dataset. This way, I won't lose 13% of the entire dataset like I would if I performed a complete case/ pairwise deletion.
+
+At this point, I am also going to drop other columns that I don't want to use as predictor variables: this includes the icon column, which is the caption for weather icons used to describe weather at a given time - it is redundant to the summary column in this dataset. 
+
+The rest of the variables in the dataset are missing between 0-1% of their values. Since this is such a small amount, I could either perform a complete case/ pairwise deletion or impute the missing values. Since I want to gain practice with imputing, I will choose the latter option. I decided to impute continuous values using a bagged forest model by applying the step_impute_bag() function from the recipes package. 
+
+```{r remove nas}
+# remove variables with missing data and non-useful data
+smart_mod <- smart_df %>% 
+  select(-cloud_cover, -icon) %>% 
+  drop_na()
+#%>% 
+#  recipes::step_impute_bag()
+```
+
+Now that all the missing values have been taken care of, I'm going to take a peek at the data through descriptive and summary statistics. 
+
+My final dataframe has 19 variables and 2,172,229 observations. 
+```{r dim}
+# explore data  
+smart_mod %>% dim()
+```
+
+The column names of my dataframe are shown below: 
+```{r names}
+smart_mod %>% names()
+```
+
+It looks like the data type for all the variables are appropriate. Most of the variables are numeric while the summary variable is categorical. The apartment ID, month, and year are all factors because I defined them to be above. Lastly, the datetime and date columns are POSIXct and Date objects, respectively. 
+
+```{r str}
+smart_mod %>% str()
+```
+
+The summary statistics for all the variables are shown in the table below: 
+
+```{r summary}
+smart_mod %>% summary() %>% 
+  kbl(caption = "Summary Statistics for all Variables in the Smart* Dataset") %>% 
+  kable_styling(full_width = F) %>% 
+  scroll_box(width = "100%", height = "200px")
+```
+
+
+Lastly, let's take a look at the first few rows of the data to get a feel for it. 
+```{r head}
+smart_mod %>% head() %>% 
+  kbl(caption = "First 6 Rows of the Smart* Dataset") %>% 
+  kable_styling(full_width = F) %>% 
+  scroll_box(width = "100%", height = "200px")
+
+```
+
+
+EDA questions to answer
+"These are "what variation occurs within the variables," and "what covariation occurs between the variables.""
+
+Exploratory data analysis (or EDA) is not based on a specific set of rules or formulas. It is more of a state of curiosity about data. It's an iterative process of:
+
+- generating questions about data 
+
+- visualize and transform your data as necessary to get answers 
+
+- use what you learned to generate more questions
+
+## Visual EDA
+
+Now for my favorite type of exploratory analysis - let's visualize the data!
+
+First off, I explore how correlated all of the numeric variables are by using the corrplot() function from the corrplot package to visualized a correlation matrix. It looks like temperature, apparent_temperature, and dew point are positively correlated, which makes sense since they are so tightly related. Interestingly, these three variables are negatively correlated with hourly_average_power_kw, which is the outcome variable of interest. Another interesting finding is that visibility is negatively correlated to humidity, precipitation intensity, and precipitation probability - this makes sense since it is hard to see far while it's raining. The other correlations are also logical since weather variables are typically all related. 
+
+```{r correlation plot}
+# correlation plot of all variables
+smart_mod %>%
+  select(where(is.numeric)) %>%
+  cor() %>%
+  corrplot(method = 'shade', order = 'FPC', type = 'full') #, bg = "grey80"
+```
+
+
+```{r eda visualizations}
+# scatterplot of all variables against power
+smart_mod %>% 
+  mutate(apt_id = as.numeric(apt_id),
+         month = as.numeric(apt_id),
+         year = as.numeric(year)) %>%  # Convert apt_id to character
+  pivot_longer(cols = c("apt_id", "temperature", "humidity", "visibility", "apparent_temperature", "pressure", "wind_speed",  "wind_bearing", "precip_intensity", "dew_point", "precip_probability", "month", "year" ), names_to = "variable", values_to = "value") %>% 
+ggplot() +
+  geom_point(aes(x = hourly_average_power_kw, y = value)) +
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal()
+
+# histogram of energy usage
+ggplot(data = smart_mod, aes(x = hourly_average_power_kw))+
+  geom_histogram(fill = "#DAA49A", col = "#875053")+
+  labs(x = "Power Usage (kW)", y = "Count")+
+  theme_minimal()
+
+# boxplot of energy usage against month
+ggplot(data = smart_mod, aes(x = month, y = hourly_average_power_kw, group = month))+
+  geom_boxplot(fill = "#DAA49A", col = "#875053")+
+  #geom_jitter(alpha = 0.4, col = "#DAA49A")+
+  labs(x = "Month", y = "Power (kW)")+
+  theme_minimal()
+
+# should I remove these outliers?
+
+# scatterplot of energy usage against apartments
+ggplot(data = smart_mod, aes(x = apt_id, y = hourly_average_power_kw))+
+  geom_point(alpha = 0.4, col = "#DAA49A")+
+  labs(x = "Apartment", y = "Power (kW)")+
+  theme_minimal()
+
+# histogram of temperature
+ggplot(data = smart_mod, aes(x = temperature))+
+  geom_histogram(fill = "#DAA49A", col = "#875053")+
+  labs(x = "Temperature (deg F)", y = "Count")+
+  theme_minimal()
+
+# histogram of humidity
+ggplot(data = smart_mod, aes(x = humidity))+
+  geom_histogram(fill = "#DAA49A", col = "#875053")+
+  labs(x = "Humidity", y = "Count")+
+  theme_minimal()
+
+# histogram of precipitation intensity
+ggplot(data = smart_mod, aes(x = precip_intensity))+
+  geom_histogram(fill = "#DAA49A", col = "#875053")+
+  labs(x = "Precipitation Intensity", y = "Count")+
+  theme_minimal()
+
+# plot of summary counts
+
+```
+
+# Model Set-Up
+"we can finally move on to building our models. We will randomly split our data into training and testing sets, set up and create our recipe, and establish cross-validation within our models."
+
+## Split Training and Testing Data
+
+First off, let's split the full dataset into training and test datasets. Like the names imply, the training dataset will be used to train the models while the test dataset will be used to test the predictive power of the models at the very end. I split the data using the initial_split() function from the rsample package and stratify on hourly_average_power_kw, the outcome variable of interest. I split the full dataset so that 3/4 of it becomes the training dataset and the remaining 1/4 becomes the test dataset. This will ensure there is a good amount of data for training while still retaining enough for substantial testing. 
+```{r split data}
+# set seed to reproduce results
+set.seed(2244)
+
+# split data
+smart_split <- rsample::initial_split(smart_mod, 
+                                        prop = 0.75,
+                                        strata = hourly_average_power_kw)
+
+# assign splits to train and test objects
+smart_train <- rsample::training(smart_split)
+smart_test <- rsample::testing(smart_split)
+```
+
+Now it's time to build a recipe for the models to use! I use the recipes package to do things like dummy code the categorical variable, summary, specify interactions, center all predictors, and scale all predictors.
+
+```{r}
+# define recipe
+smart_recipe <- recipes::recipe(hourly_average_power_kw ~ ., data = smart_train) %>% 
+  recipes::step_rm(rings) %>% #remove the rings column
+  recipes::step_dummy(all_nominal_predictors()) %>% #dummy code categorical variables
+  # recipes::step_interact(terms = ~ starts_with("type"):shucked_weight + #create interactions, use starts_with for dummy variable type
+  #                          ~ longest_shell:diameter + 
+  #                          ~ shucked_weight:shell_weight) %>% 
+  recipes::step_interact(terms = ~ date + hour + apt_id + temperature + humidity + visibility + summary + apparent_temperature + pressure + wind_speed + time + wind_bearing + precip_intensity + dew_point + precip_probability + datetime + month + year) %>% 
+  recipes::step_center(all_predictors()) %>% #center all predictors, aka numeric data mean = 0
+  recipes::step_scale(all_predictors()) #scale all predictors, aka numeric data stdev = 1
+
+smart_recipe
+```
+
+## K-fold Cross-Validation
+```{r}
+#...
+```
+
+## Model Building
+"It is now finally time to build our models! Luckily for us, since our dataset is relatively small, none of the models took very long to run, which I was able to use to my advantage in order to run multiple variations of our models, and tune different hyperparamaters with varrying ranges in order to produce the best performing models. However, these models still require quite a bit of computing power, and could therefore not be run directly in this R markdown file. To solve this, each individual model was ran in a separate R file with the loaded data saved above. Each model was then saved in RDA files and will be loaded below for our explorations of the results. Additionally, these models’ files and data can be found attached to this project in the Models and RDA folders in the respective GitHub repository which can be found here: Sunset Prediction Project.
+
+As stated earlier, we fit seven different models. These models were Logistic Regression, Linear Discriminant Analysis, Quadratic Discriminant Analysis, Lasso, Decision Tree, Random Forest, and Support Vector Machine models. The first three models are relatively simple and will take much less time to run. The final four models are the ones we are more interested in, particularly the Random Forest and Support Vector Machines model, as they are better fit for binary classification problems, which is exactly our case.
+
+Most models tend to follow a similar process, with the exceptions of the Logistic Regression, Linear Discriminant Analysis, and Quadratic Discriminant Analysis models, which are simpler and quicker. The general workflow of the model building process constituted of the following steps:
+
+1. We first set up the model by specifying what type of model it is, then we set its engine and set its mode. In this case, the mode was always set to regression since the outcome variable is continuous. 
+
+2. We then set up the workflow for the model, add the new model, and add our established sunset recipe.
+We will skip the steps 3-5 for Logistic Regression, Linear Discriminant Analysis, and Quadratic Discriminant Analysis, since they are simpler models that do not require hyperparameters to be tuned.
+
+3. We then set up the tuning grid with the parameters that we want tuned, as well as set the ranges for how many different levels of tuning we want for each parameter.
+4. We will then tune the model with the specific hyperparameters of choice.
+After which we will select the most accurate model from the tuning grid, and then finalize the workflow with those specific tuning parameters.
+5. We then fit that model with our workflow to our sunset training dataset.
+Finally, we will save our results to an RDA file in order to load them back into our main project file."
+
+```{r lm}
+# define model engine and mode
+lm_model <- parsnip::linear_reg() %>% 
+  parsnip::set_engine("lm")
+
+# set up workflow
+lm_wflow <- workflows::workflow() %>% 
+  workflows::add_model(lm_model) %>% 
+  workflows::add_recipe(smart_recipe)
+
+# fit to the training set
+lm_fit <- parsnip::fit(lm_wflow, smart_train)
+
+# view model results
+lm_fit %>% 
+  tune::extract_fit_parsnip() %>% 
+  tidy()
+
+```
+
+```{r knn}
+# define model engine and mode
+knn_model <- parsnip::nearest_neighbor(neighbors = 7) %>% 
+  parsnip::set_engine("kknn") %>% 
+  parsnip::set_mode("regression")
+
+# set up workflow
+knn_wflow <- workflow() %>% 
+  workflows::add_model(knn_model) %>% 
+  workflows::add_recipe(smart_recipe)
+
+# fit to the training set
+knn_fit <- parsnip::fit(knn_wflow, smart_train)
+
+# view model results
+knn_fit %>% 
+  tune::extract_fit_parsnip()
+
+```
+
+## Performance Metric
+
+Now you want to assess your models' performance. To do this, use the `yardstick` package:
+
+1.  Create a metric set that includes *R^2^*, RMSE (root mean squared error), and MAE (mean absolute error).
+2.  Use `augment()` to create a tibble of your model's predicted values from the **testing data** along with the actual observed ages (these are needed to assess your model's performance).
+3.  Finally, apply your metric set to the tibble, report the results, and interpret the *R\^2* value.
+
+Repeat these steps once for the linear regression model and for the KNN model.
+
+```{r}
+# make function to calculate all metrics of interest
+calculate_metrics <- yardstick::metric_set(rmse, rsq, mae)
+
+# predict values for test data and augment to test df
+abalone_predict_lm <- broom::augment(lm_fit, abalone_test) 
+
+# calculate metrics 
+calculate_metrics(abalone_predict_lm, truth = age, estimate = .pred) %>% 
+  kbl(caption = "Error Metrics for Linear Model") %>% 
+  kable_styling()
+
+```
+The RMSE (root mean squared error) measures the magnitude of error between predicted and actual values - lower RMSE values therefore reflect better model performance. Since RMSE = 2.16 here, the model's predicted values for age deviate from the actual observed values by ~2.16 years on average.
+
+The $R^2$ measures how well the model explains the variance of the actual observed age values where 1 is a perfect fit. This result means that the model explains ~55.8% of the variance in the actual data. Since this value is not very high, it seems that the relationship between the predictors and the outcome variables might not be linear. 
+
+The mean absolute error (MAE) measures the absolute difference between the predicted and actual observed values - lower RMSE values therefore reflect better model performance. Since MAE = 1.59 here, the absolute difference between the model's predicted values for age and the actual observed values is ~1.59 years on average. 
+
+```{r}
+# predict values for test data and augment to test df
+abalone_predict_knn <- broom::augment(knn_fit, abalone_test) 
+
+# calculate metrics 
+calculate_metrics(abalone_predict_knn, truth = age, estimate = .pred) %>% 
+  kbl(caption = "Error Metrics for K-Nearest Neighbor Model") %>% 
+  kable_styling()
+```
+
+The RMSE and MAE values for the KNN model are fairly similar to those of the linear model (RMSE = 2.31 and MAE = 1.65). The $R^2$ value for the KNN model is slightly lower than that of the linear model, indicating that it only explains ~49.8% of the variance in the actual data. 
+
